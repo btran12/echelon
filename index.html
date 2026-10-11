@@ -476,6 +476,7 @@ let awsEndpoint=localStorage.getItem('echelon_aws_endpoint')||'';
 let userId=localStorage.getItem('echelon_user_id')||'rider';
 let sessions=JSON.parse(localStorage.getItem('echelon_sessions')||'[]');
 let bleDevice=null,bleChar=null,bleWriteChar=null,isConnected=false;
+let bleNotifyChars=[];                 // all subscribed notify characteristics (data chars for unlock outcome)
 let blePollingInterval=null,bleKeepaliveInterval=null;
 let lastValidDataTime=0;
 let cadence=0,resistance=0,power=0,totalDist=0,startTime=null,timerInt=null;
@@ -491,6 +492,19 @@ const ECHELON_SERVICES=['0bf669f0-45f2-11e7-9598-0800200c9a66','0bf669f1-45f2-11
 const ECHELON_NOTIFY_UUIDS=['0bf669f4-45f2-11e7-9598-0800200c9a66','0bf669f2-45f2-11e7-9598-0800200c9a66','0bf669f3-45f2-11e7-9598-0800200c9a66'];
 const ECHELON_WRITE_UUIDS=['0bf669f2-45f2-11e7-9598-0800200c9a66','0bf669f1-45f2-11e7-9598-0800200c9a66','0bf669f3-45f2-11e7-9598-0800200c9a66'];
 const ACTIVATION_PACKETS=[new Uint8Array([0xF0,0xB0,0x01,0x01,0xA2]),new Uint8Array([0xF0,0xB0,0x01,0x00,0xA1])];
+// ── Echelon unlock handshake (per pedalsync.app/js/unlock.js and qdomyos-zwift echelonconnectsport.cpp) ──
+// Locked bikes send an 8-byte F0 E0 "challenge" instead of streaming telemetry. We answer with a
+// locally-built checksum-correct F0 E0 key frame, then re-enable streaming with the activation packet.
+// The bike confirms the unlock by notifying F0 A5 01 0E A4 (qdomyos-zwift) and then sending real
+// telemetry: F0 D1 (13-byte main stream), F0 D2 (resistance), F0 D3 (unlock-gated variant).
+const UNLOCK_ENABLE_CMD=new Uint8Array([0xF0,0xB0,0x01,0x01,0xA2]); // enable-streaming cmd after key write
+const UNLOCK_ACCEPT_TIMEOUT_MS=1400;   // wait for telemetry/re-challenge after writing a key frame
+const UNLOCK_MAX_ATTEMPTS=5;           // cap challenge-answer attempts per connection
+let unlockAttempts=0;                  // attempts used in current connection
+let unlockPending=false;               // an attempt is in flight
+let unlockState='locked';              // locked | unlocking | unlocked | failed
+let lastChallenge=null;                // most recent F0 E0 challenge bytes seen
+let outcomeListener=null;              // pending unlock-outcome listener on a data char
 // Standard BLE Cycling Speed & Cadence (CSC) profile UUIDs — used by Magene S3+ and other cadence sensors
 const CSC_SERVICE_UUID=0x1816;
 const CSC_MEASUREMENT_UUID=0x2A5B;
@@ -540,6 +554,167 @@ function updateAWSIndicator(c){
 }
 async function apiPost(path,body){ if(!awsEndpoint)return null; try{ const r=await fetch(awsEndpoint+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); return await r.json(); }catch(e){log('AWS error: '+e.message,'err');return null;} }
 async function apiGet(path){ if(!awsEndpoint)return null; try{ const r=await fetch(awsEndpoint+path); return await r.json(); }catch(e){log('AWS error: '+e.message,'err');return null;} }
+
+// ── Echelon F0 E0 Challenge/Response Unlock Logic ────────────────────────────────
+// Mirrors the field-proven algorithm from pedalsync.app/js/unlock.js (PS.unlock.buildLocalFrame)
+// and the acceptance rules confirmed by qdomyos-zwift's echelonconnectsport.cpp.
+function toHex(bytes){ return Array.from(bytes||[]).map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' '); }
+function checksum7(frame){ let s=0; for(let i=0;i<7;i++)s+=frame[i]; return s&0xFF; }
+function isE0Challenge(b){ return b && b.length===8 && b[0]===0xF0 && b[1]===0xE0; }
+function isUnlockAck(b){ return b && b.length===5 && b[0]===0xF0 && b[1]===0xA5 && b[2]===0x01 && b[3]===0x0E && b[4]===0xA4; } // f0a5010ea4 (qdomyos-zwift unlock ack)
+function isTelemetry(b){ return b && b.length>=4 && b[0]===0xF0 && (b[1]===0xD1 || b[1]===0xD2 || b[1]===0xD3); }
+function b64enc(bytes){ let s=''; for(let i=0;i<bytes.length;i++)s+=String.fromCharCode(bytes[i]); return btoa(s); }
+function b64dec(str){ return Uint8Array.from(atob(str),c=>c.charCodeAt(0)); }
+
+// Exact frame families observed to be accepted for specific challenges (from unlock.js KNOWN_MIDDLE)
+const UNLOCK_KNOWN_MIDDLE={
+  'F0 E0 06 65 67 39 48 23':0x38,
+  'F0 E0 50 15 17 83 92 61':0x38,
+  'F0 E0 97 30 31 30 39 31':0x12,
+  'F0 E0 65 07 09 98 07 E4':0x00,
+};
+
+// The field-proven local answer to a challenge (do not tweak — protocol research is a separate change)
+function buildLocalUnlockFrame(challenge){
+  const frame=new Uint8Array(8);
+  frame[0]=0xF0; frame[1]=0xE0;
+  frame[2]=(challenge[2]^0xA5)&0xFF;
+  frame[3]=(challenge[3]^0x5A)&0xFF;
+  const chHex=toHex(challenge);
+  frame[4]=Object.prototype.hasOwnProperty.call(UNLOCK_KNOWN_MIDDLE,chHex)
+    ? UNLOCK_KNOWN_MIDDLE[chHex]
+    : ((challenge[4]^challenge[5]^challenge[6])&0xFF);
+  frame[5]=(challenge[5]^0x3C)&0xFF;
+  frame[6]=(challenge[6]^0xC3)&0xFF;
+  frame[7]=checksum7(frame);
+  return frame;
+}
+
+// Decode a base64 server key into a live-writable F0 E0 frame (length-checked like unlock.js)
+function frameServerUnlockKey(keyB64){
+  const key=b64dec(keyB64);
+  if(key.length!==8)throw new Error('Unexpected unlock key length: '+key.length);
+  const frame=new Uint8Array(8);
+  frame[0]=0xF0; frame[1]=0xE0;
+  for(let i=2;i<7;i++)frame[i]=key[i];
+  frame[7]=checksum7(frame);
+  return frame;
+}
+
+// Serialized write queue for the F2 write characteristic — one write in flight at a time
+let f2WriteChain=Promise.resolve();
+function writeF2(data,label){
+  const run=async()=>{
+    if(!bleWriteChar)throw new Error('No write characteristic available');
+    await bleWrite(bleWriteChar,data);
+  };
+  const step=f2WriteChain.then(run,run);
+  f2WriteChain=step.catch(()=>{});
+  return step;
+}
+
+// Arm an outcome listener BEFORE the key write so an immediate response can't be missed.
+// Acceptance is NEVER "writeValue resolved" — it is real telemetry (D1/D2/D3) or the F0 A5 ack.
+// A new E0 is a rejection; silence to timeout is inconclusive (falls through to server path).
+function armUnlockOutcome(dataChars,timeoutMs){
+  const started=Date.now();
+  let done=false,resolveFn,timer;
+  const promise=new Promise(res=>{resolveFn=res;});
+  const handler=(event)=>{
+    let d;
+    try{ d=new Uint8Array(event.target.value.buffer); }catch(e){ return; }
+    if(isE0Challenge(d)) finish('rejected',new Uint8Array(d));
+    else if(isTelemetry(d)||isUnlockAck(d)) finish('handshake_accepted',null);
+  };
+  function finish(state,next){
+    if(done)return;
+    done=true;
+    clearTimeout(timer);
+    dataChars.forEach(ch=>{ try{ch.removeEventListener('characteristicvaluechanged',handler);}catch(e){} });
+    if(outcomeListener===api)outcomeListener=null;
+    resolveFn({state,nextChallenge:next||null,ms:Date.now()-started});
+  }
+  const api={promise,finish};
+  dataChars.forEach(ch=>{ try{ch.addEventListener('characteristicvaluechanged',handler);}catch(e){finish('error',null);} });
+  timer=setTimeout(()=>finish('inconclusive',null),timeoutMs||UNLOCK_ACCEPT_TIMEOUT_MS);
+  outcomeListener=api;
+  return api;
+}
+
+// Write key + enable cmd through the serialized queue, then await the armed outcome
+async function attemptUnlock(method,frame,dataChars){
+  const w=armUnlockOutcome(dataChars,UNLOCK_ACCEPT_TIMEOUT_MS);
+  try{
+    await writeF2(frame,method+'-key');
+    await writeF2(UNLOCK_ENABLE_CMD,'cmd_enable');
+  }catch(err){
+    w.finish('error',null);
+    return {method,accepted:false,result:'error',frame:toHex(frame),nextChallenge:null,error:err};
+  }
+  const outcome=await w.promise;
+  return {method,accepted:outcome.state==='handshake_accepted',result:outcome.state,
+          frame:toHex(frame),ms:outcome.ms,nextChallenge:outcome.nextChallenge,error:null};
+}
+
+// Server resolver fallback (unlock.js resolveServer): POST the challenge to /api/unlock on the
+// configured endpoint, which returns {key: base64}. Only used when the local answer fails AND an
+// endpoint is configured; otherwise the local retry loop keeps trying fresh challenges.
+async function resolveServerUnlock(challenge,dataChars){
+  if(!awsEndpoint)return {method:'server',accepted:false,result:'no_endpoint',nextChallenge:null};
+  let json=null,status=0,frame=null;
+  try{
+    const r=await fetch(awsEndpoint+'/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({challenge:b64enc(challenge)})});
+    status=r.status; json=await r.json();
+  }catch(e){ return {method:'server',accepted:false,result:'error',nextChallenge:null,error:e}; }
+  if(!json||!json.key)return {method:'server',accepted:false,result:'rejected',status,json,nextChallenge:null};
+  try{ frame=frameServerUnlockKey(json.key); }
+  catch(e){ return {method:'server',accepted:false,result:'error',status,json,badKey:true,nextChallenge:null,error:e}; }
+  const out=await attemptUnlock('server',frame,dataChars);
+  out.status=status; out.json=json;
+  return out;
+}
+
+// Main entry: called from handleBLEData when a locked bike sends its F0 E0 challenge.
+async function detectAndUnlock(challenge,dataChars){
+  if(unlockPending)return;
+  if(!bleWriteChar){ log('Locked bike sent a challenge but no write characteristic found.','err'); return; }
+  if(unlockAttempts>=UNLOCK_MAX_ATTEMPTS){
+    if(unlockState!=='failed'){ unlockState='failed'; log('Unlock gave up after '+UNLOCK_MAX_ATTEMPTS+' attempts. Bike will not stream data.','err'); }
+    return;
+  }
+  unlockPending=true; lastChallenge=challenge;
+  unlockState='unlocking'; unlockAttempts++;
+  log('🔒 Lock challenge ['+toHex(challenge)+'] — answering locally (attempt '+unlockAttempts+')…','info');
+  let outcome;
+  try{
+    outcome=await attemptUnlock('local',buildLocalUnlockFrame(challenge),dataChars);
+  }finally{
+    unlockPending=false;
+  }
+  if(outcome.accepted){
+    unlockState='unlocked';
+    log('✓ Unlock '+(outcome.result==='handshake_accepted'?'accepted':'acknowledged')+' via '+outcome.method+
+        ' frame ['+outcome.frame+'] in '+outcome.ms+'ms. Telemetry should now stream.','ok');
+    return;
+  }
+  if(outcome.result==='rejected'&&outcome.nextChallenge){
+    log('✗ Local answer rejected; bike re-challenged ['+toHex(outcome.nextChallenge)+']. Trying server fallback…','info');
+    const srv=await resolveServerUnlock(outcome.nextChallenge,dataChars).catch(()=>null);
+    if(srv&&srv.accepted){ unlockState='unlocked'; log('✓ Unlock accepted via server frame.','ok'); return; }
+    // No server (or server failed): keep listening — the bike re-issues challenges and we answer each one
+    log('Server fallback unavailable/failed ('+((srv&&srv.result)||'none')+'). Waiting for next challenge to retry locally.','info');
+    return;
+  }
+  // inconclusive / error: don't spam writes; wait for the next challenge or telemetry to classify
+  log('Unlock attempt inconclusive ('+outcome.result+'). Waiting for bike response…','info');
+}
+
+function resetUnlockState(){
+  if(outcomeListener){ try{outcomeListener.finish('error',null);}catch(e){} outcomeListener=null; }
+  unlockAttempts=0; unlockPending=false; unlockState='locked'; lastChallenge=null;
+  f2WriteChain=Promise.resolve();
+}
 async function syncFromAWS(){ if(!awsEndpoint)return; log('Syncing from AWS…','info'); const d=await apiGet('/sessions?userId='+userId); if(d&&d.sessions){sessions=d.sessions;localStorage.setItem('echelon_sessions',JSON.stringify(sessions));renderHistory();renderProgress();log('Synced '+sessions.length+' sessions.','ok');} }
 
 async function handleConnectClick(){
@@ -650,21 +825,30 @@ async function handleConnectClick(){
     }
     
     // Helper: write using the correct method for the characteristic
+    // (Web Bluetooth only exposes writeValue; pick the mode from the char's properties)
     async function bleWrite(char,data){
-      if(char.properties.writeWithoutResponse){
-        await char.writeValueWithoutResponse(data);
+      if(char.properties.writeWithoutResponse && !char.properties.write){
+        await char.writeValue(data);
+      }else if(char.properties.writeWithoutResponse){
+        try{ await char.writeValueWithoutResponse(data); }
+        catch(e){ await char.writeValue(data); }
+      }else if(char.properties.write){
+        try{ await char.writeValueWithResponse(data); }
+        catch(e){ await char.writeValue(data); }
       }else{
-        await char.writeValueWithResponse(data);
+        await char.writeValue(data);
       }
     }
     
     // ── STEP 2: Send activation packets BEFORE subscribing to notifications ──
-    // The bike won't stream data until it receives these packets
+    // The bike won't stream data until it receives these packets. If the bike is
+    // locked, it answers with an F0 E0 challenge which handleBLEData resolves via detectAndUnlock().
+    resetUnlockState();
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
       for(const pkt of ACTIVATION_PACKETS){
         try{
-          await bleWrite(bleWriteChar,pkt);
+          await writeF2(pkt,'activation');
           log('Activation packet sent: '+Array.from(pkt).map(b=>b.toString(16).padStart(2,'0')).join(' '),'ok');
         }catch(e){
           log('Activation packet failed: '+e.message,'info');
@@ -675,11 +859,13 @@ async function handleConnectClick(){
     }
     
     // ── STEP 3: NOW subscribe to notifications (bike is activated) ──
+    bleNotifyChars=[];
     for(let i=0;i<notifyChars.length;i++){
       const char=notifyChars[i];
       try{
         await char.startNotifications();
         char.addEventListener('characteristicvaluechanged',handleBLEData);
+        bleNotifyChars.push(char);
         log('Subscribed to characteristic '+i+': '+char.uuid.slice(0,8)+'…','ok');
       }catch(e){
         log('Could not subscribe to char '+i+': '+e.message,'info');
@@ -692,7 +878,7 @@ async function handleConnectClick(){
       if(!bleWriteChar || !isConnected)return;
       try{
         for(const pkt of ACTIVATION_PACKETS){
-          await bleWrite(bleWriteChar,pkt);
+          await writeF2(pkt,'keepalive');
         }
         log('[KeepAlive] Sent','info');
       }catch(e){
@@ -727,27 +913,43 @@ function handleBLEData(event){
     
     let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
     
-    // Sport 030107 8-byte format: f0 e0 ...
-    // f0 e0 14 29 10 64 83 04
-    // [3]=0x29(41)=cadence (40-60 range)
-    if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
-      extractedCad=bytes[3];
-      extractedRes=resistance;  // Keep last known resistance
-      parsed=true;
-      parseReason='8b-f0e0-cad';
+    // ── Lock challenge / unlock handshake (per pedalsync.app/js/unlock.js) ──
+    // An 8-byte F0 E0 packet is NOT cadence telemetry — it is the locked bike's
+    // challenge. Answer it with a locally-computed key frame (detectAndUnlock).
+    if(isE0Challenge(bytes)){
+      lastChallenge=new Uint8Array(bytes);
+      if(unlockState==='unlocked'){
+        log('  ? Post-unlock re-challenge ['+toHex(bytes)+'] — answering again…','info');
+        unlockState='locked';
+      }
+      detectAndUnlock(lastChallenge,bleNotifyChars.length?bleNotifyChars:[event.target]);
+      return; // never treat challenges as data
     }
+    // Unlock acknowledgement from the bike (qdomyos-zwift: f0 a5 01 0e a4)
+    if(isUnlockAck(bytes)){
+      unlockState='unlocked';
+      log('  ✓ Bike sent unlock ack [F0 A5 01 0E A4]. Streaming should begin.','ok');
+      return;
+    }
+    // Any real telemetry means the lock is resolved
+    if(isTelemetry(bytes)&&unlockState!=='unlocked'){
+      unlockState='unlocked';
+      log('  ✓ Telemetry flowing — unlock confirmed.','ok');
+    }
+
     // 5-byte format: f0 d2 - resistance updates
     // f0 d2 01 12 d5
-    // [3]=0x12(18)=resistance, cadence from 8b packets
-    else if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
+    // [3]=0x12(18)=resistance, cadence from D1 packets
+    if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
       extractedRes=bytes[3];
       extractedCad=cadence;  // Keep cadence from 8-byte packets
       parsed=true;
       parseReason='5b-f0d2';
     }
-    // 13-byte D1 format
+    // 13-byte D1 main telemetry stream (qdomyos-zwift layout):
+    // [3]=resistance, [7..8]=distance BE /100, [10]=cadence
     else if(bytes.length>=10&&bytes[0]===0xf0&&bytes[1]===0xd1){
-      extractedCad=bytes[9];
+      extractedCad=bytes[10];
       extractedRes=bytes[3];
       parsed=true;
       parseReason='13b-d1';
@@ -758,6 +960,13 @@ function handleBLEData(event){
       extractedRes=bytes[3];
       parsed=true;
       parseReason='8b-d1';
+    }
+    // F0 D3 format (unlock-gated variant seen on locked-down firmware)
+    else if(bytes.length>=5&&bytes[0]===0xf0&&bytes[1]===0xd3){
+      extractedCad=bytes.length>=11?bytes[10]:bytes[3];
+      extractedRes=bytes[3];
+      parsed=true;
+      parseReason='f0d3';
     }
     // F6 format (less common)
     else if(bytes.length===5&&bytes[0]===0xf6){
@@ -806,12 +1015,15 @@ function onDisconnected(){
   clearInterval(timerInt);
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
   if(bleKeepaliveInterval){clearInterval(bleKeepaliveInterval);bleKeepaliveInterval=null;}
-  if(bleChar){
+  resetUnlockState();
+  (bleNotifyChars.length?bleNotifyChars:[bleChar]).forEach(ch=>{
+    if(!ch)return;
     try{
-      bleChar.stopNotifications();
-      bleChar.removeEventListener('characteristicvaluechanged',handleBLEData);
+      ch.stopNotifications();
+      ch.removeEventListener('characteristicvaluechanged',handleBLEData);
     }catch(e){}
-  }
+  });
+  bleNotifyChars=[];
   log('Bike disconnected. Try reconnecting.','err'); 
   document.getElementById('liveSubtitle').textContent='Connect your bike to start tracking'; 
 }
