@@ -172,6 +172,14 @@
   .empty-icon { font-size:32px; margin-bottom:1rem; opacity:0.4; }
   .empty-state h3 { font-size:16px; font-weight:600; color:var(--text2); margin-bottom:6px; }
   .ble-warning { background:rgba(255,154,60,0.08); border:1px solid rgba(255,154,60,0.2); border-radius:var(--r-sm); padding:12px 16px; font-size:12px; color:var(--orange); line-height:1.6; margin-bottom:1.25rem; }
+
+  /* ── LOCK BANNER ── */
+  .lock-banner { background:var(--red-dim); border:1px solid rgba(255,82,82,0.25); border-radius:var(--r-sm); padding:14px 16px; margin-bottom:1.25rem; }
+  .lock-banner-title { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:13px; font-weight:700; color:var(--red); margin-bottom:6px; }
+  .lock-banner-detail { font-size:12px; color:var(--text); margin-bottom:6px; }
+  .lock-banner-challenge { font-family:var(--font-mono); font-size:11px; color:var(--text2); margin-bottom:10px; word-break:break-all; }
+  .lock-banner-note { font-size:11px; color:var(--text2); line-height:1.7; border-top:1px solid rgba(255,82,82,0.15); padding-top:10px; }
+  .lock-banner-note code { font-family:var(--font-mono); color:var(--red); }
   ::-webkit-scrollbar { width:4px; }
   ::-webkit-scrollbar-track { background:transparent; }
   ::-webkit-scrollbar-thumb { background:var(--bg3); border-radius:2px; }
@@ -277,6 +285,28 @@
   </div>
 </div>
 
+<!-- Unlock Key Modal -->
+<div class="modal-overlay hidden" id="unlockModal">
+  <div class="modal">
+    <h2>Replay an unlock key</h2>
+    <p>Paste a full response frame captured from the official Echelon app's unlock handshake. It is written to the <code style="font-family:monospace;font-size:11px;color:var(--text2)">F2</code> characteristic whenever the bike sends an <code style="font-family:monospace;font-size:11px;color:var(--text2)">F0 E0</code> challenge.</p>
+    <div class="modal-note">
+      <strong>Where to get one:</strong> sniff the app&#8596;bike handshake with an nRF52 dongle / Wireshark, or run a
+      qdomyos-zwift "Virtual Echelon" bridge and copy the frame it proxies. Keys are rolling and short-lived, so a
+      captured frame is only useful for that session — clear it afterwards.
+    </div>
+    <div class="form-group">
+      <label>Response frame (hex)</label>
+      <input type="text" id="unlockKeyInput" placeholder="F0 E0 3A 91 04 C7 2B 88" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" onclick="saveUnlockKey()">Save &amp; replay</button>
+      <button class="btn danger" onclick="clearUnlockKey()">Clear key</button>
+      <button class="btn" onclick="document.getElementById('unlockModal').classList.add('hidden')">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- Session Detail Modal (bottom sheet on mobile) -->
 <div class="session-modal hidden" id="sessionModal">
   <div class="session-modal-inner">
@@ -362,6 +392,7 @@
         <button class="btn primary" id="modeCadBtn" onclick="setCscMode('cadence')" style="flex:1;font-size:10px;padding:5px 0">Cadence</button>
         <button class="btn" id="modeSpdBtn" onclick="setCscMode('speed')" style="flex:1;font-size:10px;padding:5px 0">Speed</button>
       </div>
+      <button class="btn" id="unlockKeyBtn" onclick="openUnlockModal()" style="width:100%;margin-top:6px;font-size:10px;padding:6px 0">Unlock key…</button>
     </div>
   </aside>
 
@@ -375,6 +406,21 @@
           <div class="page-sub" id="liveSubtitle">Connect your bike to start tracking</div>
         </div>
         <div class="ble-warning" id="bleWarning" style="display:none">Web Bluetooth requires Chrome or Edge on desktop or Android. Safari and Firefox are not supported.</div>
+        <div class="lock-banner" id="lockBanner" style="display:none">
+          <div class="lock-banner-title">
+            <span>Bike is locked</span>
+            <button class="btn primary" style="font-size:11px;padding:5px 12px" onclick="openUnlockModal()">Add unlock key</button>
+          </div>
+          <div class="lock-banner-detail" id="lockBannerDetail"></div>
+          <div class="lock-banner-challenge">Last challenge: <span id="lockBannerChallenge">—</span></div>
+          <div class="lock-banner-note">
+            Post-July-2025 Echelon firmware gates BLE telemetry behind a challenge/response handshake. The bike
+            sends an 8-byte <code>F0 E0</code> challenge and expects a 128-bit rolling key derived from a master key
+            held on Echelon's servers, so the answer cannot be computed in the browser. To ride with this page, either
+            use a bike whose firmware predates the lockdown, or capture one key frame from the official app's handshake
+            (BLE sniffer or a QZ "Virtual Echelon" bridge) and replay it here — keys are single-use and expire quickly.
+          </div>
+        </div>
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem;padding:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-sm)">
           <div class="ble-dot" id="cscDotPage"></div>
           <span id="cscStatusPage" style="font-size:12px;font-family:var(--font-mono);color:var(--text2);flex:1">No cadence sensor</span>
@@ -477,9 +523,10 @@ let userId=localStorage.getItem('echelon_user_id')||'rider';
 let sessions=JSON.parse(localStorage.getItem('echelon_sessions')||'[]');
 let bleDevice=null,bleChar=null,bleWriteChar=null,isConnected=false;
 let bleNotifyChars=[];                 // all subscribed notify characteristics (data chars for unlock outcome)
-let blePollingInterval=null,bleKeepaliveInterval=null;
-let lastValidDataTime=0;
+let blePollingInterval=null;
+let lastValidDataTime=0,initStartedAt=0,lastTelemetryAt=0;
 let cadence=0,resistance=0,power=0,totalDist=0,startTime=null,timerInt=null;
+let bikeDistanceMi=0,bikeElapsedSec=0;   // values the bike reports in its own F0 D1 frame
 let currentSessionData=[],rawByteLogCount=0;
 let cscDevice=null,cscChar=null,cscConnected=false,cscCadence=0;
 let prevCrankRevs=null,prevCrankTime=null;
@@ -488,23 +535,52 @@ const MAX_PTS=60;
 let liveCad=Array(MAX_PTS).fill(null),liveRes=Array(MAX_PTS).fill(null),liveChartInst=null;
 let sessionDetailChartInst=null,currentCalMonth=new Date();
 
-const ECHELON_SERVICES=['0bf669f0-45f2-11e7-9598-0800200c9a66','0bf669f1-45f2-11e7-9598-0800200c9a66','0bf669f2-45f2-11e7-9598-0800200c9a66','0bf669f3-45f2-11e7-9598-0800200c9a66','0bf669f4-45f2-11e7-9598-0800200c9a66'];
-const ECHELON_NOTIFY_UUIDS=['0bf669f4-45f2-11e7-9598-0800200c9a66','0bf669f2-45f2-11e7-9598-0800200c9a66','0bf669f3-45f2-11e7-9598-0800200c9a66'];
-const ECHELON_WRITE_UUIDS=['0bf669f2-45f2-11e7-9598-0800200c9a66','0bf669f1-45f2-11e7-9598-0800200c9a66','0bf669f3-45f2-11e7-9598-0800200c9a66'];
-const ACTIVATION_PACKETS=[new Uint8Array([0xF0,0xB0,0x01,0x01,0xA2]),new Uint8Array([0xF0,0xB0,0x01,0x00,0xA1])];
-// ── Echelon unlock handshake (per pedalsync.app/js/unlock.js and qdomyos-zwift echelonconnectsport.cpp) ──
-// Locked bikes send an 8-byte F0 E0 "challenge" instead of streaming telemetry. We answer with a
-// locally-built checksum-correct F0 E0 key frame, then re-enable streaming with the activation packet.
-// The bike confirms the unlock by notifying F0 A5 01 0E A4 (qdomyos-zwift) and then sending real
-// telemetry: F0 D1 (13-byte main stream), F0 D2 (resistance), F0 D3 (unlock-gated variant).
-const UNLOCK_ENABLE_CMD=new Uint8Array([0xF0,0xB0,0x01,0x01,0xA2]); // enable-streaming cmd after key write
-const UNLOCK_ACCEPT_TIMEOUT_MS=1400;   // wait for telemetry/re-challenge after writing a key frame
+// ── Echelon BLE protocol ─────────────────────────────────────────────────────
+// UUIDs, init frames, poll cadence and packet layout mirror qdomyos-zwift's
+// echelonconnectsport.cpp — the only field-proven open implementation of this bike.
+const ECHELON_SERVICE_UUID='0bf669f1-45f2-11e7-9598-0800200c9a66';
+const ECHELON_WRITE_UUID='0bf669f2-45f2-11e7-9598-0800200c9a66';
+const ECHELON_NOTIFY1_UUID='0bf669f3-45f2-11e7-9598-0800200c9a66';
+const ECHELON_NOTIFY2_UUID='0bf669f4-45f2-11e7-9598-0800200c9a66';
+// Fallback probe order if the primary service is not where we expect it.
+const ECHELON_SERVICES=[ECHELON_SERVICE_UUID,'0bf669f0-45f2-11e7-9598-0800200c9a66',ECHELON_WRITE_UUID,ECHELON_NOTIFY1_UUID,ECHELON_NOTIFY2_UUID];
+const ECHELON_NOTIFY_UUIDS=[ECHELON_NOTIFY1_UUID,ECHELON_NOTIFY2_UUID];
+const ECHELON_WRITE_UUIDS=[ECHELON_WRITE_UUID];
+
+// The bike streams nothing until it has been initialised. In every frame below the last
+// byte is the sum of all preceding bytes, masked to 8 bits.
+const ECHELON_INIT_FRAMES=[
+  new Uint8Array([0xf0,0xa1,0x00,0x91]),   // repeated 4× in the reference sniffer log
+  new Uint8Array([0xf0,0xa1,0x00,0x91]),
+  new Uint8Array([0xf0,0xa1,0x00,0x91]),
+  new Uint8Array([0xf0,0xa1,0x00,0x91]),
+  new Uint8Array([0xf0,0xa3,0x00,0x93]),
+  new Uint8Array([0xf0,0xa1,0x00,0x91]),
+  new Uint8Array([0xf0,0xb0,0x01,0x01,0xa2]), // start streaming
+];
+const ECHELON_POLL_INTERVAL_MS=2000;    // f0 a0 01 <counter> <checksum> keeps the bike awake
+const ECHELON_STALL_MS=12000;           // re-init if no telemetry for this long
+const ECHELON_SPEED_PER_RPM=0.37497622; // mph per rpm
+let pollCounter=1;
+
+// ── Lock state ───────────────────────────────────────────────────────────────
+// A locked bike answers the init with an 8-byte F0 E0 challenge instead of telemetry.
+// The correct answer is a 128-bit rolling key that Echelon derives server-side from a
+// master key burned into the bike's firmware, so it cannot be computed in the browser.
+// We therefore only ever *replay* a key the user or a resolver endpoint supplies.
+const UNLOCK_ACK=new Uint8Array([0xf0,0xa5,0x01,0x0e,0xa4]);
+const UNLOCK_ACCEPT_TIMEOUT_MS=1400;   // wait for telemetry/re-challenge after writing a key
 const UNLOCK_MAX_ATTEMPTS=5;           // cap challenge-answer attempts per connection
 let unlockAttempts=0;                  // attempts used in current connection
 let unlockPending=false;               // an attempt is in flight
 let unlockState='locked';              // locked | unlocking | unlocked | failed
 let lastChallenge=null;                // most recent F0 E0 challenge bytes seen
 let outcomeListener=null;              // pending unlock-outcome listener on a data char
+let manualUnlockKey=null;              // user-supplied replay frame, or null
+try{
+  const saved=localStorage.getItem('echelon_unlock_key');
+  if(saved) manualUnlockKey=parseHexFrame(saved);
+}catch(e){}
 // Standard BLE Cycling Speed & Cadence (CSC) profile UUIDs — used by Magene S3+ and other cadence sensors
 const CSC_SERVICE_UUID=0x1816;
 const CSC_MEASUREMENT_UUID=0x2A5B;
@@ -555,67 +631,57 @@ function updateAWSIndicator(c){
 async function apiPost(path,body){ if(!awsEndpoint)return null; try{ const r=await fetch(awsEndpoint+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); return await r.json(); }catch(e){log('AWS error: '+e.message,'err');return null;} }
 async function apiGet(path){ if(!awsEndpoint)return null; try{ const r=await fetch(awsEndpoint+path); return await r.json(); }catch(e){log('AWS error: '+e.message,'err');return null;} }
 
-// ── Echelon F0 E0 Challenge/Response Unlock Logic ────────────────────────────────
-// Mirrors the field-proven algorithm from pedalsync.app/js/unlock.js (PS.unlock.buildLocalFrame)
-// and the acceptance rules confirmed by qdomyos-zwift's echelonconnectsport.cpp.
+// ── Echelon frame helpers ────────────────────────────────────────────────────
 function toHex(bytes){ return Array.from(bytes||[]).map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' '); }
-function checksum7(frame){ let s=0; for(let i=0;i<7;i++)s+=frame[i]; return s&0xFF; }
-function isE0Challenge(b){ return b && b.length===8 && b[0]===0xF0 && b[1]===0xE0; }
-function isUnlockAck(b){ return b && b.length===5 && b[0]===0xF0 && b[1]===0xA5 && b[2]===0x01 && b[3]===0x0E && b[4]===0xA4; } // f0a5010ea4 (qdomyos-zwift unlock ack)
-function isTelemetry(b){ return b && b.length>=4 && b[0]===0xF0 && (b[1]===0xD1 || b[1]===0xD2 || b[1]===0xD3); }
+// Last byte of every Echelon command frame = sum of all preceding bytes, masked to 8 bits.
+function echelonChecksum(frame){ let s=0; for(let i=0;i<frame.length-1;i++)s+=frame[i]; return s&0xFF; }
+function buildPollFrame(counter){ const f=new Uint8Array([0xf0,0xa0,0x01,counter&0xFF,0x00]); f[4]=echelonChecksum(f); return f; }
+function isLockedFrame(b){ return !!b&&b.length===8&&b[0]===0xF0&&b[1]===0xE0; }
+function isUnlockAck(b){ return !!b&&b.length===UNLOCK_ACK.length&&UNLOCK_ACK.every((v,i)=>b[i]===v); }
+function isTelemetry(b){ return !!b&&b.length>=5&&b[0]===0xF0&&(b[1]===0xD1||b[1]===0xD2); }
 function b64enc(bytes){ let s=''; for(let i=0;i<bytes.length;i++)s+=String.fromCharCode(bytes[i]); return btoa(s); }
-function b64dec(str){ return Uint8Array.from(atob(str),c=>c.charCodeAt(0)); }
-
-// Exact frame families observed to be accepted for specific challenges (from unlock.js KNOWN_MIDDLE)
-const UNLOCK_KNOWN_MIDDLE={
-  'F0 E0 06 65 67 39 48 23':0x38,
-  'F0 E0 50 15 17 83 92 61':0x38,
-  'F0 E0 97 30 31 30 39 31':0x12,
-  'F0 E0 65 07 09 98 07 E4':0x00,
-};
-
-// The field-proven local answer to a challenge (do not tweak — protocol research is a separate change)
-function buildLocalUnlockFrame(challenge){
-  const frame=new Uint8Array(8);
-  frame[0]=0xF0; frame[1]=0xE0;
-  frame[2]=(challenge[2]^0xA5)&0xFF;
-  frame[3]=(challenge[3]^0x5A)&0xFF;
-  const chHex=toHex(challenge);
-  frame[4]=Object.prototype.hasOwnProperty.call(UNLOCK_KNOWN_MIDDLE,chHex)
-    ? UNLOCK_KNOWN_MIDDLE[chHex]
-    : ((challenge[4]^challenge[5]^challenge[6])&0xFF);
-  frame[5]=(challenge[5]^0x3C)&0xFF;
-  frame[6]=(challenge[6]^0xC3)&0xFF;
-  frame[7]=checksum7(frame);
-  return frame;
+// Accepts "F0 E0 01 …", "f0e001…", or "0xF0, 0xE0, …" — whatever the user copied from a sniffer.
+function parseHexFrame(str){
+  const clean=String(str||'').replace(/0x/gi,'').replace(/[^0-9a-fA-F]/g,'');
+  if(!clean||clean.length%2!==0||clean.length<4)throw new Error('Hex frame must be an even number of digits (min 2 bytes)');
+  const out=new Uint8Array(clean.length/2);
+  for(let i=0;i<out.length;i++)out[i]=parseInt(clean.substr(i*2,2),16);
+  return out;
 }
 
-// Decode a base64 server key into a live-writable F0 E0 frame (length-checked like unlock.js)
-function frameServerUnlockKey(keyB64){
-  const key=b64dec(keyB64);
-  if(key.length!==8)throw new Error('Unexpected unlock key length: '+key.length);
-  const frame=new Uint8Array(8);
-  frame[0]=0xF0; frame[1]=0xE0;
-  for(let i=2;i<7;i++)frame[i]=key[i];
-  frame[7]=checksum7(frame);
-  return frame;
+// Web Bluetooth exposes writeValue / writeValueWithResponse / writeValueWithoutResponse
+// inconsistently across Chrome versions, so pick from the characteristic's properties.
+// Echelon's init frames are sent write-with-response; fall back if the char disagrees.
+async function bleWrite(char,data){
+  if(!char)throw new Error('No write characteristic available');
+  if(char.properties.write){
+    if(typeof char.writeValueWithResponse==='function'){
+      try{ return await char.writeValueWithResponse(data); }
+      catch(e){ /* fall through to write-without-response */ }
+    }else{
+      try{ return await char.writeValue(data); }catch(e){}
+    }
+  }
+  if(char.properties.writeWithoutResponse&&typeof char.writeValueWithoutResponse==='function'){
+    try{ return await char.writeValueWithoutResponse(data); }
+    catch(e){ return await char.writeValue(data); }
+  }
+  return await char.writeValue(data);
 }
 
-// Serialized write queue for the F2 write characteristic — one write in flight at a time
+// Serialized write queue for the F2 characteristic — one write in flight at a time, so the
+// 7-frame init sequence cannot interleave on the wire.
 let f2WriteChain=Promise.resolve();
-function writeF2(data,label){
-  const run=async()=>{
-    if(!bleWriteChar)throw new Error('No write characteristic available');
-    await bleWrite(bleWriteChar,data);
-  };
+function writeF2(data){
+  const run=()=>bleWrite(bleWriteChar,data);
   const step=f2WriteChain.then(run,run);
   f2WriteChain=step.catch(()=>{});
   return step;
 }
 
 // Arm an outcome listener BEFORE the key write so an immediate response can't be missed.
-// Acceptance is NEVER "writeValue resolved" — it is real telemetry (D1/D2/D3) or the F0 A5 ack.
-// A new E0 is a rejection; silence to timeout is inconclusive (falls through to server path).
+// Acceptance is NEVER "writeValue resolved" — it is real telemetry (D1/D2) or the F0 A5 ack.
+// A new E0 is a rejection; silence to timeout is inconclusive.
 function armUnlockOutcome(dataChars,timeoutMs){
   const started=Date.now();
   let done=false,resolveFn,timer;
@@ -623,7 +689,7 @@ function armUnlockOutcome(dataChars,timeoutMs){
   const handler=(event)=>{
     let d;
     try{ d=new Uint8Array(event.target.value.buffer); }catch(e){ return; }
-    if(isE0Challenge(d)) finish('rejected',new Uint8Array(d));
+    if(isLockedFrame(d)) finish('rejected',new Uint8Array(d));
     else if(isTelemetry(d)||isUnlockAck(d)) finish('handshake_accepted',null);
   };
   function finish(state,next){
@@ -641,12 +707,12 @@ function armUnlockOutcome(dataChars,timeoutMs){
   return api;
 }
 
-// Write key + enable cmd through the serialized queue, then await the armed outcome
+// Write the key frame, then re-request streaming, and await the armed outcome.
 async function attemptUnlock(method,frame,dataChars){
   const w=armUnlockOutcome(dataChars,UNLOCK_ACCEPT_TIMEOUT_MS);
   try{
-    await writeF2(frame,method+'-key');
-    await writeF2(UNLOCK_ENABLE_CMD,'cmd_enable');
+    await writeF2(frame);
+    await writeF2(ECHELON_INIT_FRAMES[ECHELON_INIT_FRAMES.length-1]); // f0 b0 01 01 a2
   }catch(err){
     w.finish('error',null);
     return {method,accepted:false,result:'error',frame:toHex(frame),nextChallenge:null,error:err};
@@ -656,64 +722,117 @@ async function attemptUnlock(method,frame,dataChars){
           frame:toHex(frame),ms:outcome.ms,nextChallenge:outcome.nextChallenge,error:null};
 }
 
-// Server resolver fallback (unlock.js resolveServer): POST the challenge to /api/unlock on the
-// configured endpoint, which returns {key: base64}. Only used when the local answer fails AND an
-// endpoint is configured; otherwise the local retry loop keeps trying fresh challenges.
-async function resolveServerUnlock(challenge,dataChars){
-  if(!awsEndpoint)return {method:'server',accepted:false,result:'no_endpoint',nextChallenge:null};
-  let json=null,status=0,frame=null;
+// Optional resolver: POST the challenge to /api/unlock on the configured endpoint and expect
+// {frame:"<hex>"} or {key:"<hex>"} back. A browser can only proxy a resolver, never be one —
+// the rolling key requires Echelon's master key.
+async function fetchServerUnlockKey(challenge){
+  if(!awsEndpoint)return null;
   try{
     const r=await fetch(awsEndpoint+'/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({challenge:b64enc(challenge)})});
-    status=r.status; json=await r.json();
-  }catch(e){ return {method:'server',accepted:false,result:'error',nextChallenge:null,error:e}; }
-  if(!json||!json.key)return {method:'server',accepted:false,result:'rejected',status,json,nextChallenge:null};
-  try{ frame=frameServerUnlockKey(json.key); }
-  catch(e){ return {method:'server',accepted:false,result:'error',status,json,badKey:true,nextChallenge:null,error:e}; }
-  const out=await attemptUnlock('server',frame,dataChars);
-  out.status=status; out.json=json;
-  return out;
+    const json=await r.json();
+    const raw=json&&(json.frame||json.key);
+    if(!raw)return null;
+    return parseHexFrame(raw);
+  }catch(e){ log('Unlock resolver error: '+e.message,'err'); return null; }
 }
 
-// Main entry: called from handleBLEData when a locked bike sends its F0 E0 challenge.
+// Main entry: called from handleBLEData when the bike sends its 8-byte F0 E0 challenge.
 async function detectAndUnlock(challenge,dataChars){
   if(unlockPending)return;
-  if(!bleWriteChar){ log('Locked bike sent a challenge but no write characteristic found.','err'); return; }
-  if(unlockAttempts>=UNLOCK_MAX_ATTEMPTS){
-    if(unlockState!=='failed'){ unlockState='failed'; log('Unlock gave up after '+UNLOCK_MAX_ATTEMPTS+' attempts. Bike will not stream data.','err'); }
+  lastChallenge=challenge;
+  // Latch 'failed' so the banner and log don't re-fire on every subsequent challenge.
+  if(unlockState!=='failed')unlockState='locked';
+  if(!bleWriteChar){
+    showLockBanner(challenge,'Bike is locked and no write characteristic was found.');
     return;
   }
-  unlockPending=true; lastChallenge=challenge;
-  unlockState='unlocking'; unlockAttempts++;
-  log('🔒 Lock challenge ['+toHex(challenge)+'] — answering locally (attempt '+unlockAttempts+')…','info');
+  const key=manualUnlockKey||await fetchServerUnlockKey(challenge);
+  if(!key){
+    showLockBanner(challenge,'Bike is locked. No unlock key configured.');
+    log('🔒 Locked bike sent challenge ['+toHex(challenge)+'] — no unlock key available. Add one via "Unlock key" in the sidebar.','err');
+    return;
+  }
+  if(unlockAttempts>=UNLOCK_MAX_ATTEMPTS){
+    if(unlockState!=='failed'){
+      unlockState='failed';
+      showLockBanner(challenge,'Unlock failed after '+UNLOCK_MAX_ATTEMPTS+' attempts — the key is stale or wrong.');
+      log('Unlock gave up after '+UNLOCK_MAX_ATTEMPTS+' attempts. The bike will not stream data.','err');
+    }
+    return;
+  }
+  unlockPending=true; unlockAttempts++; unlockState='unlocking';
+  log('🔒 Challenge ['+toHex(challenge)+'] — replaying unlock key ['+toHex(key)+'] (attempt '+unlockAttempts+'/'+UNLOCK_MAX_ATTEMPTS+')…','info');
   let outcome;
   try{
-    outcome=await attemptUnlock('local',buildLocalUnlockFrame(challenge),dataChars);
+    outcome=await attemptUnlock(manualUnlockKey?'manual':'server',key,dataChars);
   }finally{
     unlockPending=false;
   }
   if(outcome.accepted){
     unlockState='unlocked';
-    log('✓ Unlock '+(outcome.result==='handshake_accepted'?'accepted':'acknowledged')+' via '+outcome.method+
-        ' frame ['+outcome.frame+'] in '+outcome.ms+'ms. Telemetry should now stream.','ok');
+    hideLockBanner();
+    log('✓ Unlock accepted via '+outcome.method+' key in '+outcome.ms+'ms. Telemetry streaming.','ok');
+    return;
+  }
+  if(outcome.error){
+    showLockBanner(challenge,'Unlock write failed: '+outcome.error.message);
+    log('✗ Unlock write failed: '+outcome.error.message,'err');
     return;
   }
   if(outcome.result==='rejected'&&outcome.nextChallenge){
-    log('✗ Local answer rejected; bike re-challenged ['+toHex(outcome.nextChallenge)+']. Trying server fallback…','info');
-    const srv=await resolveServerUnlock(outcome.nextChallenge,dataChars).catch(()=>null);
-    if(srv&&srv.accepted){ unlockState='unlocked'; log('✓ Unlock accepted via server frame.','ok'); return; }
-    // No server (or server failed): keep listening — the bike re-issues challenges and we answer each one
-    log('Server fallback unavailable/failed ('+((srv&&srv.result)||'none')+'). Waiting for next challenge to retry locally.','info');
+    log('✗ Key rejected; bike re-challenged ['+toHex(outcome.nextChallenge)+'].','err');
+    showLockBanner(outcome.nextChallenge,'Unlock key rejected — the bike issued a new challenge.');
+    detectAndUnlock(outcome.nextChallenge,dataChars);
     return;
   }
-  // inconclusive / error: don't spam writes; wait for the next challenge or telemetry to classify
+  showLockBanner(challenge,'No response to the unlock key ('+outcome.result+').');
   log('Unlock attempt inconclusive ('+outcome.result+'). Waiting for bike response…','info');
 }
 
 function resetUnlockState(){
   if(outcomeListener){ try{outcomeListener.finish('error',null);}catch(e){} outcomeListener=null; }
   unlockAttempts=0; unlockPending=false; unlockState='locked'; lastChallenge=null;
+  pollCounter=1;
   f2WriteChain=Promise.resolve();
+  hideLockBanner();
+}
+
+// ── Unlock key UI ────────────────────────────────────────────────────────────
+function showLockBanner(challenge,detail){
+  const el=document.getElementById('lockBanner');
+  if(!el)return;
+  document.getElementById('lockBannerDetail').textContent=detail||'';
+  document.getElementById('lockBannerChallenge').textContent=toHex(challenge||lastChallenge||[]);
+  el.style.display='block';
+}
+function hideLockBanner(){ const el=document.getElementById('lockBanner'); if(el)el.style.display='none'; }
+
+function openUnlockModal(){
+  const inp=document.getElementById('unlockKeyInput');
+  if(inp)inp.value=localStorage.getItem('echelon_unlock_key')||'';
+  document.getElementById('unlockModal').classList.remove('hidden');
+}
+function saveUnlockKey(){
+  const raw=document.getElementById('unlockKeyInput').value.trim();
+  if(!raw){ clearUnlockKey(); return; }
+  try{
+    const frame=parseHexFrame(raw);
+    manualUnlockKey=frame;
+    localStorage.setItem('echelon_unlock_key',raw);
+    document.getElementById('unlockModal').classList.add('hidden');
+    log('Unlock key saved ['+toHex(frame)+']. It will be replayed on the next challenge.','ok');
+    if(lastChallenge&&isConnected)detectAndUnlock(lastChallenge,bleNotifyChars);
+  }catch(e){
+    log('Bad unlock key: '+e.message,'err');
+  }
+}
+function clearUnlockKey(){
+  manualUnlockKey=null;
+  localStorage.removeItem('echelon_unlock_key');
+  document.getElementById('unlockKeyInput').value='';
+  document.getElementById('unlockModal').classList.add('hidden');
+  log('Unlock key cleared.','info');
 }
 async function syncFromAWS(){ if(!awsEndpoint)return; log('Syncing from AWS…','info'); const d=await apiGet('/sessions?userId='+userId); if(d&&d.sessions){sessions=d.sessions;localStorage.setItem('echelon_sessions',JSON.stringify(sessions));renderHistory();renderProgress();log('Synced '+sessions.length+' sessions.','ok');} }
 
@@ -750,6 +869,7 @@ async function handleConnectClick(){
     // If no known service worked, scan ALL services
     if(!foundService){
       log('Scanning ALL services on device…','info');
+      let fallbackService=null;
       try{
         const allServices=await server.getPrimaryServices();
         log('Device has '+allServices.length+' services','info');
@@ -762,18 +882,28 @@ async function handleConnectClick(){
               const props=[ch.properties.notify?'N':'',ch.properties.indicate?'I':'',ch.properties.write?'W':'',ch.properties.writeWithoutResponse?'w':'',ch.properties.read?'R':''].filter(Boolean);
               log('    '+ch.uuid.slice(0,8)+'… ['+props.join('')+']','info');
             });
-            // Pick first service with chars that have read/write/notify properties
-            if(!foundService && chars.some(c=>c.properties.read||c.properties.write||c.properties.writeWithoutResponse||c.properties.notify||c.properties.indicate)){
+            // Prefer a service that actually carries the Echelon write/notify characteristics;
+            // otherwise a generic service (battery, device info) could be picked by mistake.
+            const looksLikeEchelon=chars.some(c=>
+              ECHELON_WRITE_UUIDS.includes(c.uuid)||ECHELON_NOTIFY_UUIDS.includes(c.uuid));
+            if(!foundService && looksLikeEchelon){
               foundService=svc;
               log('  ✓ Using this service','ok');
+            }else if(!foundService && !fallbackService && chars.some(c=>c.properties.write||c.properties.writeWithoutResponse||c.properties.notify||c.properties.indicate)){
+              fallbackService=svc;
+              log('  ~ Candidate service (no Echelon UUIDs), held as fallback','info');
             }
           }catch(e3){
             log('  Could not read characteristics: '+e3.message,'info');
           }
         }
       }catch(e2){log('Could not enumerate services: '+e2.message,'err');}
+      if(!foundService&&fallbackService){
+        foundService=fallbackService;
+        log('  ✓ Falling back to '+fallbackService.uuid,'info');
+      }
     }
-    
+
     if(!foundService)throw new Error('No service with readable characteristics found.');
     
     const allChars=await foundService.getCharacteristics();
@@ -824,41 +954,10 @@ async function handleConnectClick(){
       }catch(e){log('Could not search other services: '+e.message,'info');}
     }
     
-    // Helper: write using the correct method for the characteristic
-    // (Web Bluetooth only exposes writeValue; pick the mode from the char's properties)
-    async function bleWrite(char,data){
-      if(char.properties.writeWithoutResponse && !char.properties.write){
-        await char.writeValue(data);
-      }else if(char.properties.writeWithoutResponse){
-        try{ await char.writeValueWithoutResponse(data); }
-        catch(e){ await char.writeValue(data); }
-      }else if(char.properties.write){
-        try{ await char.writeValueWithResponse(data); }
-        catch(e){ await char.writeValue(data); }
-      }else{
-        await char.writeValue(data);
-      }
-    }
-    
-    // ── STEP 2: Send activation packets BEFORE subscribing to notifications ──
-    // The bike won't stream data until it receives these packets. If the bike is
-    // locked, it answers with an F0 E0 challenge which handleBLEData resolves via detectAndUnlock().
+    // ── STEP 2: Subscribe to notifications FIRST ──
+    // The bike answers the init frames on the notify characteristics (including the F0 E0
+    // challenge from a locked bike), so listeners must be attached before anything is written.
     resetUnlockState();
-    if(foundWriteChar){
-      bleWriteChar=foundWriteChar;
-      for(const pkt of ACTIVATION_PACKETS){
-        try{
-          await writeF2(pkt,'activation');
-          log('Activation packet sent: '+Array.from(pkt).map(b=>b.toString(16).padStart(2,'0')).join(' '),'ok');
-        }catch(e){
-          log('Activation packet failed: '+e.message,'info');
-        }
-      }
-    }else{
-      log('No write characteristic found - bike will not stream data.','err');
-    }
-    
-    // ── STEP 3: NOW subscribe to notifications (bike is activated) ──
     bleNotifyChars=[];
     for(let i=0;i<notifyChars.length;i++){
       const char=notifyChars[i];
@@ -866,27 +965,59 @@ async function handleConnectClick(){
         await char.startNotifications();
         char.addEventListener('characteristicvaluechanged',handleBLEData);
         bleNotifyChars.push(char);
-        log('Subscribed to characteristic '+i+': '+char.uuid.slice(0,8)+'…','ok');
+        log('Subscribed to notify char '+i+': '+char.uuid.slice(0,8)+'…','ok');
       }catch(e){
         log('Could not subscribe to char '+i+': '+e.message,'info');
       }
     }
-    
-    // ── STEP 4: Keep-alive to prevent bike's ~60s inactivity timeout ──
-    if(bleKeepaliveInterval)clearInterval(bleKeepaliveInterval);
-    bleKeepaliveInterval=setInterval(async ()=>{
-      if(!bleWriteChar || !isConnected)return;
-      try{
-        for(const pkt of ACTIVATION_PACKETS){
-          await writeF2(pkt,'keepalive');
+    if(!bleNotifyChars.length)throw new Error('Could not subscribe to any notify characteristic.');
+
+    // ── STEP 3: Run the init sequence ──
+    // This is what actually turns the telemetry stream on. Without f0 a1 / f0 a3 / f0 b0 the
+    // bike stays silent no matter how long we listen.
+    if(foundWriteChar){
+      bleWriteChar=foundWriteChar;
+      let initOk=0;
+      initStartedAt=Date.now();
+      for(const frame of ECHELON_INIT_FRAMES){
+        try{
+          await writeF2(frame);
+          initOk++;
+          log('Init frame sent: '+toHex(frame),'ok');
+        }catch(e){
+          log('Init frame failed ['+toHex(frame)+']: '+e.message,'err');
         }
-        log('[KeepAlive] Sent','info');
-      }catch(e){
-        log('[KeepAlive] Failed: '+e.message,'err');
       }
-    },15000);
-    log('Keep-alive enabled (15s interval).','info');
-    
+      if(initOk===ECHELON_INIT_FRAMES.length)log('Init sequence complete ('+initOk+' frames).','ok');
+      else log('Init sequence incomplete ('+initOk+'/'+ECHELON_INIT_FRAMES.length+').','err');
+    }else{
+      log('No write characteristic found — bike cannot be initialised.','err');
+    }
+
+    // ── STEP 4: Poll every 2s (f0 a0 01 <counter> <checksum>) ──
+    // The poll doubles as the keep-alive; stop sending it and the bike goes quiet.
+    // A stall detector re-runs init if telemetry has not arrived, unless the bike is locked.
+    if(blePollingInterval)clearInterval(blePollingInterval);
+    blePollingInterval=setInterval(async ()=>{
+      if(!bleWriteChar||!isConnected)return;
+      try{
+        await writeF2(buildPollFrame(pollCounter));
+        pollCounter=(pollCounter%255)+1;
+      }catch(e){
+        log('[Poll] Failed: '+e.message,'err');
+      }
+      const quietFor=lastValidDataTime?Date.now()-lastValidDataTime:Date.now()-initStartedAt;
+      if(quietFor>ECHELON_STALL_MS&&unlockState!=='unlocking'){
+        if(unlockState==='locked'&&lastChallenge){
+          // Locked and no key — nothing more we can do until the user supplies one.
+        }else{
+          log('[Stall] No telemetry for '+Math.round(quietFor/1000)+'s — re-running init sequence.','info');
+          initStartedAt=Date.now();
+          for(const frame of ECHELON_INIT_FRAMES){ try{ await writeF2(frame); }catch(e){} }
+        }
+      }
+    },ECHELON_POLL_INTERVAL_MS);
+    log('Poll started ('+ECHELON_POLL_INTERVAL_MS+'ms interval).','info');
     isConnected=true; setBleState('connected');
     startTime=Date.now(); startTimer();
     document.getElementById('saveSessionBtn').disabled=false;
@@ -898,123 +1029,101 @@ async function handleConnectClick(){
 function handleBLEData(event){
   try{
     const bytes=new Uint8Array(event.target.value.buffer);
-    const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-    // Log LOTS of raw packets so user can see the pattern
+    // Log raw packets so the handshake is visible while debugging
     if(rawByteLogCount<100){
-      const byteInfo=[];
-      for(let i=0;i<bytes.length;i++){
-        byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}=${bytes[i]}`);
-      }
-      log('RAW ['+bytes.length+'b]: '+hexStr, 'data');
-      log('      '+byteInfo.join(' | '), 'data');
+      log('RAW ['+bytes.length+'b]: '+toHex(bytes),'data');
       rawByteLogCount++;
     }
-    if(bytes.length<3)return;
-    
-    let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
-    
-    // ── Lock challenge / unlock handshake (per pedalsync.app/js/unlock.js) ──
-    // An 8-byte F0 E0 packet is NOT cadence telemetry — it is the locked bike's
-    // challenge. Answer it with a locally-computed key frame (detectAndUnlock).
-    if(isE0Challenge(bytes)){
+    if(bytes.length<5)return;
+
+    // ── Locked bike: 8-byte F0 E0 challenge ──
+    if(isLockedFrame(bytes)){
       lastChallenge=new Uint8Array(bytes);
       if(unlockState==='unlocked'){
         log('  ? Post-unlock re-challenge ['+toHex(bytes)+'] — answering again…','info');
         unlockState='locked';
       }
       detectAndUnlock(lastChallenge,bleNotifyChars.length?bleNotifyChars:[event.target]);
-      return; // never treat challenges as data
+      return; // never treat a challenge as telemetry
     }
-    // Unlock acknowledgement from the bike (qdomyos-zwift: f0 a5 01 0e a4)
+    // ── Unlock ack: f0 a5 01 0e a4 ──
     if(isUnlockAck(bytes)){
       unlockState='unlocked';
-      log('  ✓ Bike sent unlock ack [F0 A5 01 0E A4]. Streaming should begin.','ok');
+      hideLockBanner();
+      log('  ✓ Bike sent unlock ack ['+toHex(bytes)+']. Streaming should begin.','ok');
       return;
     }
-    // Any real telemetry means the lock is resolved
-    if(isTelemetry(bytes)&&unlockState!=='unlocked'){
+    if(bytes[0]!==0xF0){
+      if(rawByteLogCount<=100) log('  ? Non-Echelon frame ignored: '+toHex(bytes),'info');
+      return;
+    }
+    if(unlockState!=='unlocked'&&(bytes[1]===0xD1||bytes[1]===0xD2)){
       unlockState='unlocked';
-      log('  ✓ Telemetry flowing — unlock confirmed.','ok');
+      hideLockBanner();
+      log('  ✓ Telemetry flowing — bike is unlocked.','ok');
     }
 
-    // 5-byte format: f0 d2 - resistance updates
-    // f0 d2 01 12 d5
-    // [3]=0x12(18)=resistance, cadence from D1 packets
-    if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
-      extractedRes=bytes[3];
-      extractedCad=cadence;  // Keep cadence from 8-byte packets
-      parsed=true;
-      parseReason='5b-f0d2';
-    }
-    // 13-byte D1 main telemetry stream (qdomyos-zwift layout):
-    // [3]=resistance, [7..8]=distance BE /100, [10]=cadence
-    else if(bytes.length>=10&&bytes[0]===0xf0&&bytes[1]===0xd1){
-      extractedCad=bytes[10];
-      extractedRes=bytes[3];
-      parsed=true;
-      parseReason='13b-d1';
-    }
-    // 8-byte D1 format
-    else if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xd1){
-      extractedCad=bytes[7];
-      extractedRes=bytes[3];
-      parsed=true;
-      parseReason='8b-d1';
-    }
-    // F0 D3 format (unlock-gated variant seen on locked-down firmware)
-    else if(bytes.length>=5&&bytes[0]===0xf0&&bytes[1]===0xd3){
-      extractedCad=bytes.length>=11?bytes[10]:bytes[3];
-      extractedRes=bytes[3];
-      parsed=true;
-      parseReason='f0d3';
-    }
-    // F6 format (less common)
-    else if(bytes.length===5&&bytes[0]===0xf6){
-      extractedCad=(bytes[2]<<8)|bytes[3];
-      extractedRes=bytes[4];
-      parsed=true;
-      parseReason='5b-f6';
-    }
-    
-    if(!parsed){
-      if(rawByteLogCount<=100) log('  ? Unrecognized format ['+bytes.length+'b] hdr:0x'+bytes[0].toString(16)+' 0x'+bytes[1].toString(16),'info');
+    // ── F0 D2 (5 bytes): resistance ONLY, sent when the level changes ──
+    // f0 d2 01 12 d5  →  [3] = 0x12 = level 18
+    if(bytes.length===5&&bytes[1]===0xD2){
+      resistance=Math.min(bytes[3],32);   // Echelon's max resistance is 32
+      lastValidDataTime=Date.now();
+      updateLiveDisplay('5b-d2');
       return;
     }
-    
-    // Skip zero-data status packets (only for d1 format which sends periodic zeros)
-    if(extractedCad===0&&extractedRes===0&&parseReason.includes('d1'))return;
-    
-    // Sanity check - cadence 0 is valid (not pedaling), cap at 200
-    if(extractedCad>200){log('  ✗ '+parseReason+' cad:'+extractedCad+' too high','info');return;}
-    if(extractedRes>100){log('  ✗ '+parseReason+' res:'+extractedRes+' too high','info');return;}
-    
-    cadence=extractedCad;
-    resistance=extractedRes;
-    lastValidDataTime=Date.now();
-    
-    // Prefer cadence from the external CSC sensor when it is connected
-    const activeCadence=(cscConnected&&cscCadence>0)?cscCadence:cadence;
-    log('  ✓ '+parseReason+' → cad:'+activeCadence+(cscConnected?' (sensor)':'')+' res:'+resistance,'ok');
-    power=activeCadence>0?Math.round(1.09*Math.pow(activeCadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
-    const speed=Math.round(activeCadence*0.38*10)/10;
-    document.getElementById('valCadence').textContent=activeCadence;
-    document.getElementById('valResistance').textContent=resistance;
-    document.getElementById('valPower').textContent=power;
-    document.getElementById('valSpeed').innerHTML=speed.toFixed(1)+'<span class="sm-unit"> mph</span>';
-    totalDist+=(speed/3600)*(1/10);
-    document.getElementById('valDist').innerHTML=totalDist.toFixed(2)+'<span class="sm-unit"> mi</span>';
-    pushLiveChart(activeCadence,resistance);
-    currentSessionData.push({t:Date.now(),c:activeCadence,r:resistance,p:power,s:speed});
+
+    // ── F0 D1 (13 bytes): main telemetry stream ──
+    // [3..4] = elapsed seconds (BE), [7..8] = distance ×100 (BE), [10] = cadence RPM
+    if(bytes.length===13&&bytes[1]===0xD1){
+      bikeElapsedSec=((bytes[3]<<8)|bytes[4])>>>0;
+      const bikeDistRaw=((bytes[7]<<8)|bytes[8])>>>0;
+      bikeDistanceMi=bikeDistRaw/100;
+      cadence=bytes[10];
+      lastValidDataTime=Date.now();
+      updateLiveDisplay('13b-d1',bikeDistRaw);
+      return;
+    }
+
+    if(rawByteLogCount<=100) log('  ? Unrecognized Echelon frame ['+bytes.length+'b]: '+toHex(bytes),'info');
   }catch(e){
     log('Error processing BLE data: '+e.message,'err');
   }
+}
+
+// Shared readout/chart/sample update for both D1 (cadence) and D2 (resistance) frames.
+function updateLiveDisplay(reason,bikeDistRaw){
+  // Prefer cadence from the external CSC sensor when one is connected and reporting.
+  const activeCadence=(cscConnected&&cscCadence>0)?cscCadence:cadence;
+  const speed=activeCadence*ECHELON_SPEED_PER_RPM;
+  power=activeCadence>0?Math.round(1.09*Math.pow(activeCadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
+
+  document.getElementById('valCadence').textContent=activeCadence;
+  document.getElementById('valResistance').textContent=resistance;
+  document.getElementById('valPower').textContent=power;
+  document.getElementById('valSpeed').innerHTML=speed.toFixed(1)+'<span class="sm-unit"> mph</span>';
+
+  // Distance is integrated from speed over the real gap between frames. The bike also reports
+  // its own distance at D1[7..8]/100 — logged here so its unit can be confirmed against the
+  // console, but not displayed until then.
+  const now=Date.now();
+  if(lastTelemetryAt){
+    const dtHours=Math.min(now-lastTelemetryAt,2000)/3600000;  // clamp long gaps (reconnects)
+    totalDist+=speed*dtHours;
+  }
+  lastTelemetryAt=now;
+  document.getElementById('valDist').innerHTML=totalDist.toFixed(2)+'<span class="sm-unit"> mi</span>';
+
+  log('  ✓ '+reason+' → cad:'+activeCadence+(cscConnected?' (sensor)':'')+' res:'+resistance+
+      ' spd:'+speed.toFixed(1)+(bikeDistRaw!==undefined?' bikeDistRaw:'+bikeDistRaw+' bikeElapsed:'+bikeElapsedSec+'s':''),'ok');
+
+  pushLiveChart(activeCadence,resistance);
+  currentSessionData.push({t:now,c:activeCadence,r:resistance,p:power,s:Math.round(speed*10)/10});
 }
 function onDisconnected(){ 
   isConnected=false; 
   setBleState('idle'); 
   clearInterval(timerInt);
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
-  if(bleKeepaliveInterval){clearInterval(bleKeepaliveInterval);bleKeepaliveInterval=null;}
   resetUnlockState();
   (bleNotifyChars.length?bleNotifyChars:[bleChar]).forEach(ch=>{
     if(!ch)return;
@@ -1024,13 +1133,14 @@ function onDisconnected(){
     }catch(e){}
   });
   bleNotifyChars=[];
+  lastTelemetryAt=0;initStartedAt=0;lastValidDataTime=0;
+  bleWriteChar=null;bleChar=null;
   log('Bike disconnected. Try reconnecting.','err'); 
   document.getElementById('liveSubtitle').textContent='Connect your bike to start tracking'; 
 }
-function disconnectBike(){ 
+function disconnectBike(){
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
-  if(bleKeepaliveInterval){clearInterval(bleKeepaliveInterval);bleKeepaliveInterval=null;}
-  if(bleDevice&&bleDevice.gatt.connected)bleDevice.gatt.disconnect(); 
+  if(bleDevice&&bleDevice.gatt.connected)bleDevice.gatt.disconnect();
 }
 
 // ── Magene / BLE CSC Cadence Sensor ──────────────────────────────────────────
@@ -1261,6 +1371,8 @@ async function saveSession(){
 function resetLive(){
   currentSessionData=[];totalDist=0;startTime=isConnected||cscConnected?Date.now():null;
   cscCadence=0;prevCrankRevs=null;prevCrankTime=null;
+  lastTelemetryAt=0;bikeDistanceMi=0;bikeElapsedSec=0;
+  cadence=0;resistance=0;power=0;
   liveCad=Array(MAX_PTS).fill(null);liveRes=Array(MAX_PTS).fill(null);
   if(liveChartInst){liveChartInst.data.datasets[0].data=[...liveCad];liveChartInst.data.datasets[1].data=[...liveRes];liveChartInst.update('none');}
   ['valCadence','valResistance','valPower'].forEach(id=>document.getElementById(id).textContent='—');
